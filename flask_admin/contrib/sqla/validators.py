@@ -1,17 +1,32 @@
+import typing as t
+
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.orm.exc import NoResultFound
-
+from wtforms import Field
+from wtforms import Form
 from wtforms import ValidationError
-try:
-    from wtforms.validators import InputRequired
-except ImportError:
-    from wtforms.validators import Required as InputRequired
+from wtforms.form import BaseForm
+from wtforms.validators import InputRequired
+
+from flask_admin._compat import filter_list
+from flask_admin._types import T_COLUMN
+from flask_admin._types import T_SQLALCHEMY_MODEL
+from flask_admin._types import T_TRANSLATABLE
+from flask_admin.babel import lazy_gettext
+from flask_admin.contrib.sqla._compat import _get_deprecated_session
+from flask_admin.contrib.sqla._types import T_SESSION_OR_DB
 
 
-class Unique(object):
+class Unique:
     """Checks field value unicity against specified table field.
 
-    :param get_session:
-        A function that return a SQAlchemy Session.
+    :param db_session:
+        A db object (``flask_sqlalchemy.SQLAlchemy`` or
+        ``flask_sqlalchemy_lite.SQLAlchemy``) or a scoped session. It is kept
+        as-is and the concrete session is only resolved when the validator
+        runs, so each validation queries the session of the current
+        request/app context rather than the one that happened to be active
+        when the form was scaffolded.
     :param model:
         The model to check unicity against.
     :param column:
@@ -19,48 +34,86 @@ class Unique(object):
     :param message:
         The error message.
     """
-    field_flags = ('unique', )
 
-    def __init__(self, db_session, model, column, message=None):
+    field_flags = {"unique": True}
+
+    def __init__(
+        self,
+        db_session: T_SESSION_OR_DB,
+        model: type[T_SQLALCHEMY_MODEL],
+        column: T_COLUMN,
+        message: T_TRANSLATABLE | None = None,
+    ) -> None:
         self.db_session = db_session
         self.model = model
         self.column = column
-        self.message = message
+        self.message = message or lazy_gettext("Already exists.")
 
-    def __call__(self, form, field):
+    @staticmethod
+    def _same_record(obj_a: t.Any, obj_b: t.Any) -> bool:
+        """Compare two model instances by primary key rather than object
+        identity. This is session-agnostic: two objects representing the same
+        DB row are considered equal even when they were loaded by different
+        Session instances (e.g. with flask-sqlalchemy-lite).
+        """
+        if obj_a == obj_b:
+            return True
+
+        if type(obj_a) is not type(obj_b):
+            return False
+
+        mapper = sa_inspect(type(obj_a))
+        pk_attrs = [col.key for col in mapper.primary_key]
+        return all(getattr(obj_a, attr) == getattr(obj_b, attr) for attr in pk_attrs)
+
+    def __call__(self, form: Form, field: Field) -> None:
         # databases allow multiple NULL values for unique columns
         if field.data is None:
             return
 
-        try:
-            obj = (self.db_session.query(self.model)
-                   .filter(self.column == field.data)
-                   .one())
+        # Resolve the session here, not in __init__: forms are scaffolded once at
+        # startup, and a Session captured then would be shared across requests and
+        # never committed, rolled back or closed, leaving its connection "idle in
+        # transaction". https://github.com/pallets-eco/flask-admin/issues/2831
+        session = _get_deprecated_session(self.db_session)
 
-            if not hasattr(form, '_obj') or not form._obj == obj:
-                if self.message is None:
-                    self.message = field.gettext(u'Already exists.')
-                raise ValidationError(self.message)
+        try:
+            obj = session.query(self.model).filter(self.column == field.data).one()
+
+            if not hasattr(form, "_obj") or not self._same_record(form._obj, obj):
+                raise ValidationError(str(self.message))
         except NoResultFound:
             pass
 
 
 class ItemsRequired(InputRequired):
     """
-    A version of the ``InputRequired`` validator that works with relations,
-    to require a minimum number of related items.
+    A version of the ``InputRequired`` validator for collection-valued
+    relation fields and inline forms, requiring a minimum number of related
+    items. Fields exposing ``entries`` and a callable ``should_delete``
+    exclude entries marked for deletion from the count.
+
+    .. versionchanged:: 2.2.2
+        Support multi-select relation fields as well as inline forms.
     """
-    def __init__(self, min=1, message=None):
-        super(ItemsRequired, self).__init__(message=message)
+
+    def __init__(self, min: int = 1, message: T_TRANSLATABLE | None = None) -> None:
+        super().__init__(message=message)
         self.min = min
 
-    def __call__(self, form, field):
-        if len(field.data) < self.min:
+    def __call__(self, form: BaseForm, field: Field) -> None:
+        entries = getattr(field, "entries", None)
+        should_delete = getattr(field, "should_delete", None)
+        if entries is not None and callable(should_delete):
+            items = filter_list(lambda e: not should_delete(e), entries)
+        else:
+            items = field.data or []
+        if len(items) < self.min:
             if self.message is None:
                 message = field.ngettext(
-                    u"At least %(num)d item is required",
-                    u"At least %(num)d items are required",
-                    self.min
+                    "At least %(num)d item is required",
+                    "At least %(num)d items are required",
+                    self.min,
                 )
             else:
                 message = self.message
@@ -68,32 +121,42 @@ class ItemsRequired(InputRequired):
             raise ValidationError(message)
 
 
-def valid_currency(form, field):
+def valid_currency(form: Form, field: Field) -> None:
     from sqlalchemy_utils import Currency
+
     try:
         Currency(field.data)
-    except (TypeError, ValueError):
-        raise ValidationError(field.gettext(u'Not a valid ISO currency code (e.g. USD, EUR, CNY).'))
+    except (TypeError, ValueError) as err:
+        raise ValidationError(
+            field.gettext("Not a valid ISO currency code (e.g. USD, EUR, CNY).")
+        ) from err
 
 
-def valid_color(form, field):
+def valid_color(form: Form, field: Field) -> None:
     from colour import Color
+
     try:
         Color(field.data)
-    except (ValueError):
-        raise ValidationError(field.gettext(u'Not a valid color (e.g. "red", "#f00", "#ff0000").'))
+    except ValueError as err:
+        raise ValidationError(
+            field.gettext('Not a valid color (e.g. "red", "#f00", "#ff0000").')
+        ) from err
 
 
-class TimeZoneValidator(object):
+class TimeZoneValidator:
     """
     Tries to coerce a TimZone object from input data
     """
-    def __init__(self, coerce_function):
+
+    def __init__(self, coerce_function: t.Callable[[str], t.Any]) -> None:
         self.coerce_function = coerce_function
 
-    def __call__(self, form, field):
+    def __call__(self, form: BaseForm, field: Field) -> None:
         try:
             self.coerce_function(str(field.data))
-        except Exception:
-            msg = u'Not a valid timezone (e.g. "America/New_York", "Africa/Johannesburg", "Asia/Singapore").'
-            raise ValidationError(field.gettext(msg))
+        except Exception as err:
+            msg = (
+                'Not a valid timezone (e.g. "America/New_York", '
+                '"Africa/Johannesburg", "Asia/Singapore").'
+            )
+            raise ValidationError(field.gettext(msg)) from err
